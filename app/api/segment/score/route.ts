@@ -36,23 +36,24 @@ function paceToString(secPerKm: number | null) {
   return `${m}:${String(s).padStart(2, "0")}/km`;
 }
 
-// Simple V1 scoring: explainable + tunable
+// V1 scoring: simple, explainable, tunable
 function computeWinability(params: {
-  gapSec: number; // yourPR - KOM (positive => behind)
+  gapSec: number; // yourPR - KOMref (positive => behind)
   distanceM: number;
-  elevationGainM: number; // rough
+  elevationGainM: number; // rough proxy
 }) {
   // Gap score: 0s behind => 100, >=60s behind => 0
   const gapScore = clamp(100 - (params.gapSec / 60) * 100);
 
   // Difficulty score: penalize long / hilly segments
-  // distance effect: 0..5000m mapped to 100..40
-  const distPenalty = clamp((params.distanceM / 5000) * 60, 0, 60); // 0..60
-  // elevation effect: 0..200m mapped to 0..40 penalty
-  const elevPenalty = clamp((params.elevationGainM / 200) * 40, 0, 40); // 0..40
-  const difficultyScore = clamp(100 - (distPenalty + elevPenalty)); // 100..0
+  // distance penalty: 0..5000m => 0..60
+  const distPenalty = clamp((params.distanceM / 5000) * 60, 0, 60);
+  // elevation penalty: 0..200m => 0..40
+  const elevPenalty = clamp((params.elevationGainM / 200) * 40, 0, 40);
 
-  // Sprint bonus for short segments
+  const difficultyScore = clamp(100 - (distPenalty + elevPenalty));
+
+  // Sprint bonus
   const sprintBonus =
     params.distanceM <= 600 ? 10 : params.distanceM <= 1200 ? 5 : 0;
 
@@ -78,6 +79,7 @@ function computeWinability(params: {
 async function getAccessTokenFromSupabase() {
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
   const clientId = process.env.STRAVA_CLIENT_ID;
   const clientSecret = process.env.STRAVA_CLIENT_SECRET;
 
@@ -92,7 +94,7 @@ async function getAccessTokenFromSupabase() {
 
   const tokenRes = await supabase
     .from("strava_tokens")
-    .select("athlete_id, access_token, refresh_token, expires_at")
+    .select("athlete_id, access_token, refresh_token, expires_at, created_at")
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
@@ -104,7 +106,7 @@ async function getAccessTokenFromSupabase() {
   let { access_token, refresh_token, expires_at } = tokenRes.data;
   const now = Math.floor(Date.now() / 1000);
 
-  // refresh if expired or about to expire
+  // refresh if expired / near-expiry
   if (expires_at <= now + 60) {
     const res = await fetch("https://www.strava.com/oauth/token", {
       method: "POST",
@@ -164,11 +166,12 @@ export async function GET(req: Request) {
 
   const headers = { Authorization: `Bearer ${token.access_token}` };
 
-  // 1) Segment details
+  // Segment details (includes athlete_segment_stats + xoms)
   const segRes = await fetch(
     `https://www.strava.com/api/v3/segments/${segmentId}`,
     { headers }
   );
+
   if (!segRes.ok) {
     const txt = await segRes.text();
     return NextResponse.json(
@@ -176,95 +179,89 @@ export async function GET(req: Request) {
       { status: 500, headers: CORS_HEADERS }
     );
   }
+
   const seg = await segRes.json();
 
-  const distanceM: number = seg.distance ?? 0;
-  const elevHigh: number = seg.elevation_high ?? 0;
-  const elevLow: number = seg.elevation_low ?? 0;
+  const distanceM: number = seg?.distance ?? 0;
+  const elevHigh: number = seg?.elevation_high ?? 0;
+  const elevLow: number = seg?.elevation_low ?? 0;
   const elevationGainM = Math.max(0, elevHigh - elevLow); // rough proxy
 
-  // 2) Your PR on this segment (best effort)
-  const effRes = await fetch(
-    `https://www.strava.com/api/v3/segment_efforts?segment_id=${segmentId}&per_page=1`,
-    { headers }
-  );
-  if (!effRes.ok) {
-    const txt = await effRes.text();
-    return NextResponse.json(
-      { ok: false, error: "Segment efforts fetch failed", details: txt },
-      { status: 500, headers: CORS_HEADERS }
-    );
-  }
-  const efforts = await effRes.json();
-  const bestEffort = Array.isArray(efforts) && efforts.length ? efforts[0] : null;
-  const yourPRSec: number | null = bestEffort?.elapsed_time ?? null;
+  // Your PR (if you have done this segment)
+  const yourPRSec: number | null =
+    seg?.athlete_segment_stats?.pr_elapsed_time ?? null;
 
-  // 3) KOM/CR time from leaderboard top 1
-  const lbRes = await fetch(
-    `https://www.strava.com/api/v3/segments/${segmentId}/leaderboard?per_page=1`,
-    { headers }
-  );
-  if (!lbRes.ok) {
-    const txt = await lbRes.text();
-    return NextResponse.json(
-      { ok: false, error: "Leaderboard fetch failed", details: txt },
-      { status: 500, headers: CORS_HEADERS }
-    );
-  }
-  const lb = await lbRes.json();
-  const topEntry = lb?.entries?.[0] ?? null;
-  const komSec: number | null = topEntry?.elapsed_time ?? null;
+  // KOM-like reference time provided by Strava (leaderboard may be forbidden)
+  const komRefSec: number | null = seg?.xoms?.kom ?? seg?.xoms?.overall ?? null;
 
-  // Compute gap + target pace
   const gapSec =
-    yourPRSec !== null && komSec !== null ? yourPRSec - komSec : null;
+    yourPRSec !== null && komRefSec !== null ? yourPRSec - komRefSec : null;
 
-  const targetPace = komSec !== null ? paceToString(paceSecondsPerKm(komSec, distanceM)) : null;
-  const yourPace = yourPRSec !== null ? paceToString(paceSecondsPerKm(yourPRSec, distanceM)) : null;
+  const yourPace =
+    yourPRSec !== null ? paceToString(paceSecondsPerKm(yourPRSec, distanceM)) : null;
 
-  // Score only if we have both times
+  const komPace =
+    komRefSec !== null ? paceToString(paceSecondsPerKm(komRefSec, distanceM)) : null;
+
   const score =
     gapSec !== null
       ? computeWinability({ gapSec, distanceM, elevationGainM })
+      : null;
+
+  const note =
+    yourPRSec === null
+      ? "No PR found for this segment yet. Run it once to compute your gap."
+      : komRefSec === null
+      ? "No KOM reference available for this segment (xoms missing)."
       : null;
 
   return NextResponse.json(
     {
       ok: true,
       segment: {
-        id: seg.id,
-        name: seg.name,
+        id: seg?.id,
+        name: seg?.name ?? null,
         distance_m: distanceM,
-        avg_grade: seg.average_grade ?? null,
-        max_grade: seg.maximum_grade ?? null,
+        avg_grade: seg?.average_grade ?? null,
+        max_grade: seg?.maximum_grade ?? null,
         elevation_high: elevHigh,
         elevation_low: elevLow,
-        city: seg.city ?? null,
-        state: seg.state ?? null,
-        country: seg.country ?? null,
+        city: seg?.city ?? null,
+        state: seg?.state ?? null,
+        country: seg?.country ?? null,
       },
       performance: {
         your_pr_seconds: yourPRSec,
         your_pr_time: yourPRSec !== null ? secondsToMMSS(yourPRSec) : null,
         your_pace: yourPace,
-        kom_seconds: komSec,
-        kom_time: komSec !== null ? secondsToMMSS(komSec) : null,
-        kom_pace: targetPace,
+
+        kom_seconds: komRefSec,
+        kom_time: komRefSec !== null ? secondsToMMSS(komRefSec) : null,
+        kom_pace: komPace,
+
         gap_seconds: gapSec,
-        gap_time: gapSec !== null ? `${gapSec >= 0 ? "+" : "-"}${secondsToMMSS(Math.abs(gapSec))}` : null,
+        gap_time:
+          gapSec !== null
+            ? `${gapSec >= 0 ? "+" : "-"}${secondsToMMSS(Math.abs(gapSec))}`
+            : null,
       },
       projection: score
         ? {
             winability: score.winability,
             color: score.color,
             breakdown: score.breakdown,
+            note: null,
           }
         : {
             winability: null,
             color: "red",
             breakdown: null,
-            note: "No PR found for this segment yet (or leaderboard unavailable).",
+            note,
           },
+      debug: {
+        xoms: seg?.xoms ?? null,
+        athlete_segment_stats: seg?.athlete_segment_stats ?? null,
+      },
     },
     { headers: CORS_HEADERS }
   );
