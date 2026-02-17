@@ -1,268 +1,217 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 
-const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET,OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization",
-};
+/* -------------------------------------------------- */
+/* Helpers */
+/* -------------------------------------------------- */
 
-export async function OPTIONS() {
-  return new Response(null, { status: 204, headers: CORS_HEADERS });
+function secondsToTime(sec: number | null): string | null {
+  if (!sec || !Number.isFinite(sec)) return null;
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.floor(sec % 60);
+
+  if (h > 0) {
+    return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  }
+  return `${m}:${String(s).padStart(2, "0")}`;
 }
 
-function clamp(n: number, min = 0, max = 100) {
-  return Math.max(min, Math.min(max, n));
-}
-
-function secondsToMMSS(s: number) {
-  if (!Number.isFinite(s) || s < 0) return null;
-  const m = Math.floor(s / 60);
-  const r = Math.round(s % 60);
-  return `${m}:${String(r).padStart(2, "0")}`;
-}
-
-function paceSecondsPerKm(timeSec: number, distanceM: number) {
-  if (!timeSec || !distanceM) return null;
-  const km = distanceM / 1000;
-  if (km <= 0) return null;
-  return timeSec / km;
-}
-
-function paceToString(secPerKm: number | null) {
-  if (secPerKm === null) return null;
+function paceFromSeconds(distanceM: number, seconds: number | null): string | null {
+  if (!seconds || !distanceM) return null;
+  const secPerKm = seconds / (distanceM / 1000);
   const m = Math.floor(secPerKm / 60);
   const s = Math.round(secPerKm % 60);
   return `${m}:${String(s).padStart(2, "0")}/km`;
 }
 
-// V1 scoring: simple, explainable, tunable
-function computeWinability(params: {
-  gapSec: number; // yourPR - KOMref (positive => behind)
-  distanceM: number;
-  elevationGainM: number; // rough proxy
-}) {
-  // Gap score: 0s behind => 100, >=60s behind => 0
-  const gapScore = clamp(100 - (params.gapSec / 60) * 100);
+/* 🔧 FIX IMPORTANT : parse "5:58" → 358 */
+function parseTimeToSeconds(t: unknown): number | null {
+  if (typeof t === "number" && Number.isFinite(t)) return t;
+  if (typeof t !== "string") return null;
 
-  // Difficulty score: penalize long / hilly segments
-  // distance penalty: 0..5000m => 0..60
-  const distPenalty = clamp((params.distanceM / 5000) * 60, 0, 60);
-  // elevation penalty: 0..200m => 0..40
-  const elevPenalty = clamp((params.elevationGainM / 200) * 40, 0, 40);
+  const parts = t.trim().split(":").map((p) => Number(p));
+  if (parts.some((n) => !Number.isFinite(n))) return null;
 
-  const difficultyScore = clamp(100 - (distPenalty + elevPenalty));
+  if (parts.length === 2) {
+    const [m, s] = parts;
+    return m * 60 + s;
+  }
 
-  // Sprint bonus
-  const sprintBonus =
-    params.distanceM <= 600 ? 10 : params.distanceM <= 1200 ? 5 : 0;
+  if (parts.length === 3) {
+    const [h, m, s] = parts;
+    return h * 3600 + m * 60 + s;
+  }
 
-  const winability = clamp(
-    gapScore * 0.65 + difficultyScore * 0.25 + sprintBonus * 0.1
-  );
-
-  let color: "green" | "orange" | "red" = "red";
-  if (winability >= 70) color = "green";
-  else if (winability >= 40) color = "orange";
-
-  return {
-    winability: Math.round(winability),
-    color,
-    breakdown: {
-      gapScore: Math.round(gapScore),
-      difficultyScore: Math.round(difficultyScore),
-      sprintBonus,
-    },
-  };
+  return null;
 }
 
-async function getAccessTokenFromSupabase() {
-  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-  const clientId = process.env.STRAVA_CLIENT_ID;
-  const clientSecret = process.env.STRAVA_CLIENT_SECRET;
-
-  if (!supabaseUrl || !serviceKey) {
-    return { error: "Missing Supabase env vars" as const };
-  }
-  if (!clientId || !clientSecret) {
-    return { error: "Missing Strava client env vars" as const };
-  }
-
-  const supabase = createClient(supabaseUrl, serviceKey);
-
-  const tokenRes = await supabase
-    .from("strava_tokens")
-    .select("athlete_id, access_token, refresh_token, expires_at, created_at")
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  if (tokenRes.error || !tokenRes.data) {
-    return { error: "No Strava tokens found in DB" as const };
-  }
-
-  let { access_token, refresh_token, expires_at } = tokenRes.data;
-  const now = Math.floor(Date.now() / 1000);
-
-  // refresh if expired / near-expiry
-  if (expires_at <= now + 60) {
-    const res = await fetch("https://www.strava.com/oauth/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        client_id: clientId,
-        client_secret: clientSecret,
-        grant_type: "refresh_token",
-        refresh_token,
-      }),
-    });
-
-    if (!res.ok) {
-      const txt = await res.text();
-      return { error: `Strava refresh_token failed: ${txt}` as const };
-    }
-
-    const refreshed = await res.json();
-    access_token = refreshed.access_token;
-    refresh_token = refreshed.refresh_token;
-    expires_at = refreshed.expires_at;
-
-    await supabase.from("strava_tokens").upsert(
-      {
-        athlete_id: tokenRes.data.athlete_id,
-        access_token,
-        refresh_token,
-        expires_at,
-        scope: refreshed.scope ?? null,
-      },
-      { onConflict: "athlete_id" }
-    );
-  }
-
-  return { access_token } as const;
+function computeWinability(gapSec: number): {
+  score: number;
+  color: "green" | "orange" | "red";
+} {
+  if (gapSec <= 5) return { score: 95, color: "green" };
+  if (gapSec <= 15) return { score: 80, color: "green" };
+  if (gapSec <= 30) return { score: 60, color: "orange" };
+  if (gapSec <= 60) return { score: 40, color: "orange" };
+  return { score: 15, color: "red" };
 }
+
+/* -------------------------------------------------- */
+/* Route */
+/* -------------------------------------------------- */
 
 export async function GET(req: Request) {
-  const url = new URL(req.url);
-  const idStr = url.searchParams.get("id");
-  const segmentId = Number(idStr);
+  try {
+    const { searchParams } = new URL(req.url);
+    const segmentId = searchParams.get("id");
 
-  if (!Number.isFinite(segmentId)) {
-    return NextResponse.json(
-      { ok: false, error: "Missing or invalid segment id" },
-      { status: 400, headers: CORS_HEADERS }
+    if (!segmentId) {
+      return NextResponse.json(
+        { ok: false, error: "Missing segment id" },
+        { status: 400 }
+      );
+    }
+
+    /* ENV -------------------------------------------------- */
+
+    const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+    const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+    const clientId = process.env.STRAVA_CLIENT_ID!;
+    const clientSecret = process.env.STRAVA_CLIENT_SECRET!;
+
+    const supabase = createClient(supabaseUrl, serviceKey);
+
+    /* TOKEN -------------------------------------------------- */
+
+    const tokenRes = await supabase
+      .from("strava_tokens")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (!tokenRes.data) {
+      return NextResponse.json({
+        ok: false,
+        error: "No Strava tokens found",
+      });
+    }
+
+    let { access_token } = tokenRes.data;
+
+    /* SEGMENT INFO ----------------------------------------- */
+
+    const segRes = await fetch(
+      `https://www.strava.com/api/v3/segments/${segmentId}`,
+      {
+        headers: { Authorization: `Bearer ${access_token}` },
+      }
     );
-  }
 
-  const token = await getAccessTokenFromSupabase();
-  if ("error" in token) {
-    return NextResponse.json(
-      { ok: false, error: token.error },
-      { status: 500, headers: CORS_HEADERS }
+    if (!segRes.ok) {
+      const txt = await segRes.text();
+      return NextResponse.json({
+        ok: false,
+        error: "Segment fetch failed",
+        details: txt,
+      });
+    }
+
+    const seg = await segRes.json();
+
+    /* ATHLETE STATS ---------------------------------------- */
+
+    const statsRes = await fetch(
+      `https://www.strava.com/api/v3/segments/${segmentId}/all_efforts`,
+      {
+        headers: { Authorization: `Bearer ${access_token}` },
+      }
     );
-  }
 
-  const headers = { Authorization: `Bearer ${token.access_token}` };
+    let prSeconds: number | null = null;
 
-  // Segment details (includes athlete_segment_stats + xoms)
-  const segRes = await fetch(
-    `https://www.strava.com/api/v3/segments/${segmentId}`,
-    { headers }
-  );
+    if (statsRes.ok) {
+      const efforts = await statsRes.json();
+      if (efforts?.length > 0) {
+        prSeconds = efforts[0].elapsed_time ?? null;
+      }
+    }
 
-  if (!segRes.ok) {
-    const txt = await segRes.text();
-    return NextResponse.json(
-      { ok: false, error: "Segment fetch failed", details: txt },
-      { status: 500, headers: CORS_HEADERS }
-    );
-  }
+    /* KOM --------------------------------------------------- */
 
-  const seg = await segRes.json();
+    const komRaw = seg?.xoms?.kom ?? seg?.xoms?.overall ?? null;
+    const komSeconds = parseTimeToSeconds(komRaw);
 
-  const distanceM: number = seg?.distance ?? 0;
-  const elevHigh: number = seg?.elevation_high ?? 0;
-  const elevLow: number = seg?.elevation_low ?? 0;
-  const elevationGainM = Math.max(0, elevHigh - elevLow); // rough proxy
+    /* GAP --------------------------------------------------- */
 
-  // Your PR (if you have done this segment)
-  const yourPRSec: number | null =
-    seg?.athlete_segment_stats?.pr_elapsed_time ?? null;
+    const gapSeconds =
+      prSeconds && komSeconds ? prSeconds - komSeconds : null;
 
-  // KOM-like reference time provided by Strava (leaderboard may be forbidden)
-  const komRefSec: number | null = seg?.xoms?.kom ?? seg?.xoms?.overall ?? null;
+    /* SCORE ------------------------------------------------- */
 
-  const gapSec =
-    yourPRSec !== null && komRefSec !== null ? yourPRSec - komRefSec : null;
+    let winability: number | null = null;
+    let color: "green" | "orange" | "red" = "red";
 
-  const yourPace =
-    yourPRSec !== null ? paceToString(paceSecondsPerKm(yourPRSec, distanceM)) : null;
+    if (gapSeconds !== null) {
+      const score = computeWinability(gapSeconds);
+      winability = score.score;
+      color = score.color;
+    }
 
-  const komPace =
-    komRefSec !== null ? paceToString(paceSecondsPerKm(komRefSec, distanceM)) : null;
+    /* RESPONSE --------------------------------------------- */
 
-  const score =
-    gapSec !== null
-      ? computeWinability({ gapSec, distanceM, elevationGainM })
-      : null;
-
-  const note =
-    yourPRSec === null
-      ? "No PR found for this segment yet. Run it once to compute your gap."
-      : komRefSec === null
-      ? "No KOM reference available for this segment (xoms missing)."
-      : null;
-
-  return NextResponse.json(
-    {
+    return NextResponse.json({
       ok: true,
+
       segment: {
-        id: seg?.id,
-        name: seg?.name ?? null,
-        distance_m: distanceM,
-        avg_grade: seg?.average_grade ?? null,
-        max_grade: seg?.maximum_grade ?? null,
-        elevation_high: elevHigh,
-        elevation_low: elevLow,
-        city: seg?.city ?? null,
-        state: seg?.state ?? null,
-        country: seg?.country ?? null,
+        id: seg.id,
+        name: seg.name,
+        distance_m: seg.distance,
+        avg_grade: seg.average_grade,
+        max_grade: seg.maximum_grade,
+        elevation_high: seg.elevation_high,
+        elevation_low: seg.elevation_low,
+        city: seg.city,
+        state: seg.state,
+        country: seg.country,
       },
+
       performance: {
-        your_pr_seconds: yourPRSec,
-        your_pr_time: yourPRSec !== null ? secondsToMMSS(yourPRSec) : null,
-        your_pace: yourPace,
+        your_pr_seconds: prSeconds,
+        your_pr_time: secondsToTime(prSeconds),
+        your_pace: paceFromSeconds(seg.distance, prSeconds),
 
-        kom_seconds: komRefSec,
-        kom_time: komRefSec !== null ? secondsToMMSS(komRefSec) : null,
-        kom_pace: komPace,
+        kom_seconds: komSeconds,
+        kom_time: secondsToTime(komSeconds),
+        kom_pace: paceFromSeconds(seg.distance, komSeconds),
 
-        gap_seconds: gapSec,
-        gap_time:
-          gapSec !== null
-            ? `${gapSec >= 0 ? "+" : "-"}${secondsToMMSS(Math.abs(gapSec))}`
-            : null,
+        gap_seconds: gapSeconds,
+        gap_time: secondsToTime(gapSeconds),
       },
-      projection: score
-        ? {
-            winability: score.winability,
-            color: score.color,
-            breakdown: score.breakdown,
-            note: null,
-          }
-        : {
-            winability: null,
-            color: "red",
-            breakdown: null,
-            note,
-          },
+
+      projection:
+        gapSeconds !== null
+          ? {
+              winability,
+              color,
+              note: "Score based on PR vs KOM gap",
+            }
+          : {
+              winability: null,
+              color: "red",
+              note:
+                "No PR found for this segment yet. Run it once to compute your gap.",
+            },
+
       debug: {
         xoms: seg?.xoms ?? null,
-        athlete_segment_stats: seg?.athlete_segment_stats ?? null,
       },
-    },
-    { headers: CORS_HEADERS }
-  );
+    });
+  } catch (e: any) {
+    return NextResponse.json(
+      { ok: false, error: e?.message ?? "Unknown error" },
+      { status: 500 }
+    );
+  }
 }
