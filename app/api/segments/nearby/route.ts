@@ -1,6 +1,12 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET,OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+};
+
 type StravaExploreResponse = {
   segments: Array<{
     id: number;
@@ -21,9 +27,7 @@ type StravaExploreResponse = {
 };
 
 function toBounds(lat: number, lng: number, radiusKm: number): string {
-  // approx: 1 deg lat ~ 111 km
   const dLat = radiusKm / 111;
-  // 1 deg lon ~ 111km * cos(lat)
   const dLng = radiusKm / (111 * Math.cos((lat * Math.PI) / 180));
   const south = lat - dLat;
   const west = lng - dLng;
@@ -55,6 +59,10 @@ async function refreshStravaToken(params: {
   return res.json();
 }
 
+export async function OPTIONS() {
+  return new Response(null, { status: 204, headers: CORS_HEADERS });
+}
+
 export async function GET(req: Request) {
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -65,13 +73,13 @@ export async function GET(req: Request) {
   if (!supabaseUrl || !serviceKey) {
     return NextResponse.json(
       { ok: false, error: "Missing Supabase env vars" },
-      { status: 500 }
+      { status: 500, headers: CORS_HEADERS }
     );
   }
   if (!clientId || !clientSecret) {
     return NextResponse.json(
       { ok: false, error: "Missing Strava client env vars" },
-      { status: 500 }
+      { status: 500, headers: CORS_HEADERS }
     );
   }
 
@@ -83,13 +91,12 @@ export async function GET(req: Request) {
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
     return NextResponse.json(
       { ok: false, error: "Missing or invalid lat/lng" },
-      { status: 400 }
+      { status: 400, headers: CORS_HEADERS }
     );
   }
 
   const supabase = createClient(supabaseUrl, serviceKey);
 
-  // For now: take the most recent token row (single-user dev)
   const tokenRes = await supabase
     .from("strava_tokens")
     .select("athlete_id, access_token, refresh_token, expires_at")
@@ -100,14 +107,13 @@ export async function GET(req: Request) {
   if (tokenRes.error || !tokenRes.data) {
     return NextResponse.json(
       { ok: false, error: "No Strava tokens found in DB" },
-      { status: 500 }
+      { status: 500, headers: CORS_HEADERS }
     );
   }
 
   let { access_token, refresh_token, expires_at } = tokenRes.data;
   const now = Math.floor(Date.now() / 1000);
 
-  // Refresh if expired (or close to expire)
   if (expires_at <= now + 60) {
     try {
       const refreshed = await refreshStravaToken({
@@ -132,8 +138,12 @@ export async function GET(req: Request) {
       );
     } catch (e: any) {
       return NextResponse.json(
-        { ok: false, error: "Token refresh failed", details: String(e?.message ?? e) },
-        { status: 500 }
+        {
+          ok: false,
+          error: "Token refresh failed",
+          details: String(e?.message ?? e),
+        },
+        { status: 500, headers: CORS_HEADERS }
       );
     }
   }
@@ -152,13 +162,12 @@ export async function GET(req: Request) {
     const txt = await exploreRes.text();
     return NextResponse.json(
       { ok: false, error: "Strava explore failed", details: txt },
-      { status: 500 }
+      { status: 500, headers: CORS_HEADERS }
     );
   }
 
   const data = (await exploreRes.json()) as StravaExploreResponse;
 
-  // Light transform for the frontend
   const segments = (data.segments ?? []).map((s) => ({
     id: s.id,
     name: s.name,
@@ -167,17 +176,20 @@ export async function GET(req: Request) {
     max_grade: s.maximum_grade,
     elevation_high: s.elevation_high,
     elevation_low: s.elevation_low,
-    points: s.points, // polyline (if present)
+    points: s.points,
     start_latlng: s.start_latlng,
     end_latlng: s.end_latlng,
     location: [s.city, s.state, s.country].filter(Boolean).join(", "),
   }));
 
-  return NextResponse.json({
-    ok: true,
-    center: { lat, lng },
-    radiusKm,
-    count: segments.length,
-    segments,
-  });
+  return NextResponse.json(
+    {
+      ok: true,
+      center: { lat, lng },
+      radiusKm,
+      count: segments.length,
+      segments,
+    },
+    { headers: CORS_HEADERS }
+  );
 }
